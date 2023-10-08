@@ -52,7 +52,7 @@ _Static_assert(
 	"READ_DATA and READ_CLOCK must have consequtive GPIO pins due to PIO constraints (see PINCTRL discussion in RP2040 datasheet)");
 #endif
 
-#define FREQ_FREQ_HZ (5)
+#define FREQ_FREQ_HZ (1)
 
 #define CONFIG_H
 #endif

@@ -11,13 +11,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -80,12 +83,41 @@ struct controller_status {
 	uint32_t status;
 };
 
+char* nrz_analyzer_path;
+
+enum nrz_analyzer_state {
+	NA_IDLE = 0,
+	NA_NEW,
+	NA_RUNNING,
+	NA_DONE,
+};
+
+struct nrz_analyzer_entry {
+	uint32_t ts_ticks;
+	int integrity0;
+	int integrity1;
+	int cylinder;
+};
+
+struct nrz_analyzer_shared {
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	char nrz_path[1<<12];
+	enum nrz_analyzer_state state;
+	char stdout_buf[1<<20];
+	ssize_t stdout_n_bytes;
+	struct nrz_analyzer_entry entry;
+} *nrz_analyzer_shared;
+
+struct nrz_analyzer_entry* nrz_analyzer_log = NULL;
+
 struct com_file {
 	int in_use;
 	int fd;
 	int sequence;
 	size_t bytes_written;
 	size_t bytes_total;
+	unsigned buffer_index;
 	struct adler32 adler;
 	int n_non_zero_bytes;
 };
@@ -153,6 +185,9 @@ static void telemetry_log_status(void)
 
 	if (current_controls == last_controls && current_st == last_st) return;
 	telemetry_pending = 0;
+
+	// XXX check this, I think FA(ULT) has become O(n)C(ylinder), but it
+	// also looks rather fragile
 
 	#define RC(x) \
 		((current_controls&(1<<(CONTROL_ ## x))) != (last_controls&(1<<(CONTROL_ ## x)))) ? '>' : ':', \
@@ -299,11 +334,13 @@ static void com__handle_msg(char* msg)
 	} else if (is_payload(msg, CPPP_DATA_HEADER, &tail)) {
 		int n_bytes = -1;
 		char filename[1<<10];
-		if (sscanf(tail, " %d %s", &n_bytes, filename) == 2) {
+		unsigned buffer_index = 0;
+		if (sscanf(tail, " %u %d %s", &buffer_index, &n_bytes, filename) == 2) {
 			assert(!comfile->in_use);
 			char other_filename[1<<11];
 			char* path = filename;
 			for (;;) {
+				// XXX reuse same file / truncate if retrying a download?
 				int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
 				if (fd == -1) {
 					if (errno == EEXIST) {
@@ -321,6 +358,7 @@ static void com__handle_msg(char* msg)
 				comfile->in_use = 1;
 				comfile->fd = fd;
 				comfile->bytes_total = n_bytes;
+				comfile->buffer_index = buffer_index;
 				adler32_init(&comfile->adler);
 				com_printf("D/L %d bytes [%s]...", n_bytes, path);
 				telemetry_log("beginning to download %d bytes...", n_bytes);
@@ -475,6 +513,14 @@ void* io_thread_start(void* arg)
 	com_enqueue("%s 1", CMDSTR_subscribe_to_status);
 
 	for (;;) {
+		pthread_mutex_lock(&nrz_analyzer_shared->mutex);
+		if (nrz_analyzer_shared->state == NA_DONE) {
+			//nrz_analyzer_shared->entry.ts_ticks = SDL_GetTicks();
+			arrput(nrz_analyzer_log, nrz_analyzer_shared->entry);
+			nrz_analyzer_shared->state = NA_IDLE;
+		}
+		pthread_mutex_unlock(&nrz_analyzer_shared->mutex);
+
 		fd_set rfds, wfds;
 
 		FD_ZERO(&rfds);
@@ -514,7 +560,7 @@ void* io_thread_start(void* arg)
 			size_t n = strlen(c);
 			assert(write(com.fd, c, n) != -1);
 			free(c);
-			assert(write(com.fd, "\r\n", 2) != -1);
+			assert(write(com.fd, "\r\n", 2) != -1); // XXX didn't I switch to "\n"-only?
 		}
 	}
 	return NULL;
@@ -628,14 +674,181 @@ static void pop_danger_style(void)
 	ImGui::PopStyleColor(3);
 }
 
-int main(int argc, char** argv)
+const char* prg;
+
+__attribute__ ((noreturn))
+static void usage(int exit_status)
 {
-	if (argc != 2 && argc != 3) {
-		fprintf(stderr, "Usage: %s </path/to/tty/for/smd-pico-controller> [font size px]\n", argv[0]);
-		fprintf(stderr, "Try `/dev/ttyACM0`, or run `dmesg` or `ls -ltr /dev/` to see/guess what tty is assigned to the device\n");
-		fprintf(stderr, "You can also pass an empty string as path to test the GUI (many things don't really work)\n");
+	//                         1         2         3         4         5         6         7
+	//               01234567890123456789012345678901234567890123456789012345678901234567890123456789
+	fprintf(stderr, "\n");
+	fprintf(stderr, "Usage: %s </path/to/tty/for/smd-pico-controller> [-p <px>] [-x </path/to/exe>]\n", prg);
+	fprintf(stderr, "\n");
+	fprintf(stderr, "Try `/dev/ttyACM0`, or run `dmesg` or `ls -ltr /dev/` to see/guess what tty is\n");
+	fprintf(stderr, "assigned to the device (after plugging it in). You can also pass an empty string\n");
+	fprintf(stderr, "as path to test the GUI.\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, " -p <font size px>\n");
+	fprintf(stderr, "    Override font size\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, " -x <path to nrz analyzer / head alignment executable>\n");
+	fprintf(stderr, "    Enables NRZ analyzer / head alignment functionality via an executable provided\n");
+	fprintf(stderr, "    by you. It must take 1 argument; a path to an .nrz file, and must print\n");
+	fprintf(stderr, "    key/value pairs to stdout:\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "      integrity0=420\n");
+	fprintf(stderr, "      integrity1=666\n");
+	fprintf(stderr, "      cylinder=123\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    The integrity values must be between 0 and 1000, where 0 is worst and 1000\n");
+	fprintf(stderr, "    is best. `integrity0` should be present, but `integrity1` is optional.\n");
+	fprintf(stderr, "    `cylinder` (optional) is the cylinder detected by your analyzer; this is\n");
+	fprintf(stderr, "    used for displaying discrepancies between expected/detected cylinder\n");
+	fprintf(stderr, "    (CDC 9760/9762 heads can be misaligned by several cylinders).\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "    \"Back in the day\" head alignment was typically done with a CDC FTU\n");
+	fprintf(stderr, "    (\"Field Test Unit\") and a special \"alignment disk pack\". But if data\n");
+	fprintf(stderr, "    disk packs is all you have, you cannot do head alignment without also\n");
+	fprintf(stderr, "    understanding the sector format (which hopefully contains checksum and\n");
+	fprintf(stderr, "    cylinder) well enough to assess data integrity. The drive itself doesn't\n");
+	fprintf(stderr, "    know the sector format, which is why you must provide your own executable.\n");
+	fprintf(stderr, "\n");
+	exit(exit_status);
+}
+
+static pid_t start_analyzer_host(void)
+{
+	nrz_analyzer_shared = (struct nrz_analyzer_shared*) mmap(
+		NULL,
+		sizeof *nrz_analyzer_shared,
+		PROT_READ | PROT_WRITE,
+		MAP_SHARED | MAP_ANONYMOUS,
+		-1,
+		0);
+	if (nrz_analyzer_shared == MAP_FAILED) {
+		fprintf(stderr, "mmap() failed\n");
 		exit(EXIT_FAILURE);
 	}
+
+	assert(pthread_mutex_init(&nrz_analyzer_shared->mutex, NULL) == 0);
+	assert(pthread_cond_init(&nrz_analyzer_shared->cond, NULL) == 0);
+
+	pid_t child_pid = fork();
+	if (child_pid == 0) {
+		// child
+		for (;;) {
+			// wait for new job and grab it
+			pthread_mutex_lock(&nrz_analyzer_shared->mutex);
+			while (nrz_analyzer_shared->state != NA_NEW) {
+				pthread_cond_wait(&nrz_analyzer_shared->cond, &nrz_analyzer_shared->mutex);
+			}
+			char* nrz_path = duplicate_string(nrz_analyzer_shared->nrz_path);
+			nrz_analyzer_shared->state = NA_RUNNING;
+			pthread_mutex_unlock(&nrz_analyzer_shared->mutex);
+
+			// fork again; child executes analyzer; parent reads
+			// stdout and waits for exit
+			int pair[2];
+			assert(pipe(pair) != -1);
+			pid_t exec_pid = fork();
+			if (exec_pid == 0) {
+				// child
+				assert(close(0) != -1);
+				assert(dup2(pair[1], 1) != -1);
+				assert(close(pair[0]) != -1);
+				assert(close(pair[1]) != -1);
+				char* child_argv[] = {
+					nrz_analyzer_path,
+					nrz_path,
+					NULL,
+				};
+				execv(nrz_analyzer_path, child_argv);
+				assert(!"UNREACHABLE");
+			} else {
+				// parent
+				free(nrz_path);
+				assert(close(pair[1]) != -1);
+				nrz_analyzer_shared->stdout_n_bytes = read(pair[0], nrz_analyzer_shared->stdout_buf, sizeof nrz_analyzer_shared->stdout_buf);
+				assert(nrz_analyzer_shared->stdout_n_bytes != -1);
+				int wstatus;
+				assert(waitpid(exec_pid, &wstatus, 0) != -1);
+
+				pthread_mutex_lock(&nrz_analyzer_shared->mutex);
+				nrz_analyzer_shared->state = NA_DONE;
+				pthread_mutex_unlock(&nrz_analyzer_shared->mutex);
+			}
+		}
+		assert(!"UNREACHABLE");
+	} else {
+		return child_pid;
+	}
+}
+
+
+int main(int argc, char** argv)
+{
+	prg = argv[0];
+	if (argc < 2) usage(EXIT_FAILURE);
+
+	int font_size = 18; // overridable with -p <px> argument
+
+	const char* tty_path = NULL;
+
+	{
+		int switching = 0;
+		for (int argi = 1; argi < argc; argi++) {
+			char* arg = argv[argi];
+			const int arglen = strlen(arg);
+			if (switching == 0) {
+				if (arglen >= 2 && arg[0] == '-') {
+					if (arg[1] == 'p') {
+						switching = 'p';
+					} else if (arg[1] == 'x') {
+						switching = 'x';
+					} else if (arg[1] == 'h') {
+						usage(EXIT_SUCCESS);
+					} else {
+						fprintf(stderr, "invalid switch %s\n", arg);
+						usage(EXIT_FAILURE);
+					}
+				} else {
+					if (tty_path == NULL) {
+						tty_path = arg;
+					} else {
+						fprintf(stderr, "only one non-positional arg (tty path) allowed\n");
+						usage(EXIT_FAILURE);
+					}
+				}
+			} else if (switching == 'p') {
+				font_size = atoi(arg);
+				if (font_size < 1) {
+					fprintf(stderr, "invalid font size %s\n", arg);
+					usage(EXIT_FAILURE);
+				}
+				switching = 0;
+			} else if (switching == 'x') {
+				nrz_analyzer_path = arg;
+				struct stat st;
+				if (stat(nrz_analyzer_path, &st) == -1) {
+					fprintf(stderr, "%s: %s\n", nrz_analyzer_path, strerror(errno));
+					exit(EXIT_FAILURE);
+				}
+				if (!(st.st_mode & S_IXUSR) || (st.st_mode & S_IFDIR)) {
+					fprintf(stderr, "%s: not an exectuable\n", nrz_analyzer_path);
+					exit(EXIT_FAILURE);
+				}
+				switching = 0;
+			} else {
+				assert(!"UNREACHABLE");
+			}
+		}
+		if (switching != 0) {
+			fprintf(stderr, "switch -%c requires an argument\n", switching);
+			usage(EXIT_FAILURE);
+		}
+	}
+
+	pid_t nrz_analyzer_child_pid = nrz_analyzer_path != NULL ? start_analyzer_host() : 0;
 
 	#ifdef TELEMETRY_LOG
 	com.telemetry_log_file = fopen("telemetry.log", "a");
@@ -691,7 +904,7 @@ int main(int argc, char** argv)
 	int batch_cylinder0 = 0;
 	int batch_cylinder1 = 822;
 	int batch_head_set = 31;
-	int common_32bit_word_count = MAX_DATA_BUFFER_SIZE/4;
+	int common_byte_count = MAX_DATA_BUFFER_SIZE;
 	int common_servo_offset = 0;
 	int common_data_strobe_delay = 0;
 	bool poll_gpio = false;
@@ -702,19 +915,23 @@ int main(int argc, char** argv)
 
 	int max_status_txt_width = 0;
 
-	int font_size = 18;
-	if (argc == 3) {
-		font_size = atoi(argv[2]);
-		if (font_size < 1) {
-			fprintf(stderr, "invalid font size [%s]\n", argv[2]);
-			exit(EXIT_FAILURE);
-		}
-	}
 	ImFont* font = io.Fonts->AddFontFromFileTTF("Inconsolata-Medium.ttf", font_size);
 	io.Fonts->Build();
 
 	int exiting = 0;
 	while (!exiting) {
+
+		// XXX does this belong in com thread?
+		#if 0
+		pthread_mutex_lock(&nrz_analyzer_shared->mutex);
+		if (nrz_analyzer_shared->state == NA_DONE) {
+			nrz_analyzer_shared->entry.ts_ticks = SDL_GetTicks();
+			arrput(nrz_analyzer_log, nrz_analyzer_shared->entry);
+			nrz_analyzer_shared->state = NA_IDLE;
+		}
+		pthread_mutex_unlock(&nrz_analyzer_shared->mutex);
+		#endif
+
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
 			if ((ev.type == SDL_QUIT) || (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE)) {
@@ -730,11 +947,16 @@ int main(int argc, char** argv)
 
 		pthread_rwlock_rdlock(&com.rwlock);
 
+		if (nrz_analyzer_path != NULL) {
+			ImGui::Begin("NRZ Analyzer / Head Alignment");
+			ImGui::End();
+		}
+
 		#ifdef LOOPBACK_TEST
 		{
 			ImGui::Begin("LOOPBACK TEST");
 			if (ImGui::Button("Read 8k")) {
-				com_enqueue("%s 2048 0 1", CMDSTR_op_read_data);
+				com_enqueue("%s 8192 0 1", CMDSTR_op_read_data);
 			}
 			ImGui::SameLine();
 			if (ImGui::Button("Transmit Data")) {
@@ -789,14 +1011,14 @@ int main(int argc, char** argv)
 
 			ImGui::SeparatorText("Ops");
 			if (ImGui::Button("Read data (no checks)")) {
-				com_enqueue("%s %d %d %d", CMDSTR_op_read_data, MAX_DATA_BUFFER_SIZE/4, /*index_sync=*/1, /*skip_checks=*/0);
+				com_enqueue("%s %d %d %d", CMDSTR_op_read_data, MAX_DATA_BUFFER_SIZE, /*index_sync=*/1, /*skip_checks=*/0);
 			}
 			ImGui::SameLine();
 			if (ImGui::Checkbox("Continuous", &continuous_read) && continuous_read) {
-				com_enqueue("%s %d %d %d", CMDSTR_op_read_data, MAX_DATA_BUFFER_SIZE/4, /*index_sync=*/1, /*skip_checks=*/0);
+				com_enqueue("%s %d %d %d", CMDSTR_op_read_data, MAX_DATA_BUFFER_SIZE, /*index_sync=*/1, /*skip_checks=*/0);
 			}
 			if (continuous_read && com.file_serial > continuous_read_serial) {
-				com_enqueue("%s %d %d %d", CMDSTR_op_read_data, MAX_DATA_BUFFER_SIZE/4, /*index_sync=*/1, /*skip_checks=*/0);
+				com_enqueue("%s %d %d %d", CMDSTR_op_read_data, MAX_DATA_BUFFER_SIZE, /*index_sync=*/1, /*skip_checks=*/0);
 				continuous_read_serial = com.file_serial;
 			}
 
@@ -985,15 +1207,15 @@ int main(int argc, char** argv)
 				ImGui::CheckboxFlags("Head 3", &batch_head_set, 1<<3);
 				ImGui::SameLine();
 				ImGui::CheckboxFlags("Head 4", &batch_head_set, 1<<4);
-				ImGui::InputInt("32bit Word Count", &common_32bit_word_count);
-				if (common_32bit_word_count < 0) common_32bit_word_count = 0;
+				ImGui::InputInt("Byte Count", &common_byte_count);
+				if (common_byte_count < 0) common_byte_count = 0;
 				if (ImGui::Button("Execute!")) {
 					com_enqueue("%s %d %d %d %d %d %d",
 						CMDSTR_op_read_batch,
 						batch_cylinder0,
 						batch_cylinder1,
 						batch_head_set,
-						common_32bit_word_count,
+						common_byte_count,
 						common_servo_offset,
 						common_data_strobe_delay);
 				}
@@ -1028,8 +1250,8 @@ int main(int argc, char** argv)
 					// nothing
 				} break;
 				case 4: {
-					ImGui::InputInt("32bit Word Count", &common_32bit_word_count);
-					if (common_32bit_word_count < 0) common_32bit_word_count = 0;
+					ImGui::InputInt("Byte Count", &common_byte_count);
+					if (common_byte_count < 0) common_byte_count = 0;
 					ImGui::Checkbox("Index Sync", &basic_index_sync);
 					ImGui::SetItemTooltip("Waits until INDEX signal from drive before reading");
 					ImGui::Checkbox("Skip Checks", &basic_skip_checks);
@@ -1054,7 +1276,7 @@ int main(int argc, char** argv)
 					case 4: {
 						com_enqueue("%s %d %d %d",
 							CMDSTR_op_read_data,
-							common_32bit_word_count,
+							common_byte_count,
 							basic_index_sync?1:0,
 							basic_skip_checks?1:0);
 					} break;
@@ -1200,6 +1422,10 @@ int main(int argc, char** argv)
 	SDL_DestroyWindow(window);
 
 	com_shutdown();
+
+	if (nrz_analyzer_path != NULL) {
+		kill(nrz_analyzer_child_pid, SIGTERM);
+	}
 
 	return EXIT_SUCCESS;
 }

@@ -14,6 +14,7 @@
 #include "xop.h"
 #include "base64.h"
 #include "adler32.h"
+#include "dumbrle.h"
 #include "loopback_test.h"
 
 unsigned stdin_received_bytes;
@@ -111,7 +112,21 @@ struct {
 	unsigned bytes_total;
 	unsigned sequence;
 	struct adler32 adler;
+	struct dumbrle_enc dumbrle_enc;
 } data_transfer;
+
+static void restart_data_transfer(unsigned buffer_index)
+{
+	enum buffer_status st = get_buffer_status(buffer_index);
+	if (st != WRITTEN && st != TRANSFERRED) PANIC(PANIC_UNEXPECTED_STATE);
+	memset(&data_transfer, 0, sizeof data_transfer);
+	data_transfer.is_transfering = 1;
+	data_transfer.buffer_index = buffer_index;
+	data_transfer.bytes_total = get_buffer_size(buffer_index);
+	printf("%s %u %d %s\n", CPPP_DATA_HEADER, buffer_index, data_transfer.bytes_total, get_buffer_filename(buffer_index));
+	adler32_init(&data_transfer.adler);
+	dumbrle_enc_init(&data_transfer.dumbrle_enc);
+}
 
 static void handle_frontend_data_transfers(void)
 {
@@ -121,16 +136,11 @@ static void handle_frontend_data_transfers(void)
 			// nothing to transfer
 			return;
 		}
-
-		memset(&data_transfer, 0, sizeof data_transfer);
-		data_transfer.is_transfering = 1;
-		data_transfer.buffer_index = buffer_index;
-		data_transfer.bytes_total = get_buffer_size(buffer_index);
-		printf("%s %d %s\n", CPPP_DATA_HEADER, data_transfer.bytes_total, get_buffer_filename(buffer_index));
-		adler32_init(&data_transfer.adler);
+		restart_data_transfer(buffer_index);
 	}
 
-	if (!data_transfer.is_transfering) PANIC(PANIC_XXX);
+	if (!data_transfer.is_transfering) PANIC(PANIC_UNEXPECTED_STATE);
+
 	for (int i = 0; i < DATA_TRANSFER_LINES_PER_CHUNK && data_transfer.is_transfering; i++) {
 		const int remaining = data_transfer.bytes_total - data_transfer.bytes_transferred;
 		const int n = remaining > DATA_TRANSFER_BYTES_PER_LINE ? DATA_TRANSFER_BYTES_PER_LINE : remaining;
@@ -151,7 +161,7 @@ static void handle_frontend_data_transfers(void)
 		data_transfer.bytes_transferred += n;
 		if (data_transfer.bytes_transferred == data_transfer.bytes_total) {
 			data_transfer.is_transfering = 0;
-			release_buffer(buffer_index);
+			transferred_buffer(buffer_index);
 			uint32_t checksum = adler32_sum(&data_transfer.adler);
 			printf("%s %.05d %lu\n", CPPP_DATA_FOOTER, data_transfer.sequence, checksum);
 			break;
@@ -253,8 +263,20 @@ static int parse(void)
 		loopback_test_fire(n_bytes);
 	} break;
 	case COMMAND_terminate_op: {
-		terminate_op();
-		printf(CPPP_INFO "TERMINATE!\n");
+		if (terminate_op()) {
+			printf(CPPP_INFO "op terminated\n");
+		} else {
+			printf(CPPP_INFO "no op is running\n");
+		}
+	} break;
+	case COMMAND_data_ack: {
+		release_buffer(command_parser.arguments[0].u);
+	} break;
+	case COMMAND_data_retry: {
+		restart_data_transfer(command_parser.arguments[0].u);
+	} break;
+	case COMMAND_data_cancel: {
+		const unsigned buffer_index = command_parser.arguments[0].u; // TODO
 	} break;
 	case COMMAND_op_reset: {
 		job_begin();
@@ -306,14 +328,18 @@ static int parse(void)
 		}
 	} break;
 	case COMMAND_op_read_batch: {
-		const unsigned cylinder0      = command_parser.arguments[0].u;
-		const unsigned cylinder1      = command_parser.arguments[1].u;
-		const unsigned head_set       = command_parser.arguments[2].u;
-		const unsigned n_32bit_words  = command_parser.arguments[3].u;
-		const int servo_offset        = command_parser.arguments[4].i;
-		const int data_strobe_delay   = command_parser.arguments[5].i;
+		const unsigned cylinder0     = command_parser.arguments[0].u;
+		const unsigned cylinder1     = command_parser.arguments[1].u;
+		const unsigned head_set      = command_parser.arguments[2].u;
+		const unsigned n_bytes       = command_parser.arguments[3].u;
+		const int servo_offset       = command_parser.arguments[4].i;
+		const int data_strobe_delay  = command_parser.arguments[5].i;
 		job_begin();
-		xop_read_batch(cylinder0, cylinder1, head_set, n_32bit_words, servo_offset, data_strobe_delay);
+		xop_read_batch(cylinder0, cylinder1, head_set, n_bytes, servo_offset, data_strobe_delay);
+	} break;
+	case COMMAND_op_read_loop: {
+		job_begin();
+		xop_read_loop();
 	} break;
 	default: {
 		printf(CPPP_ERROR "unhandled command %s/%d\n",

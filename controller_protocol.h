@@ -21,6 +21,9 @@
 	COMMAND(xfer_test,                "u"        ) \
 	COMMAND(loopback_test,            "u"        ) \
 	COMMAND(terminate_op,             ""         ) \
+	COMMAND(data_ack,                 "u"        ) \
+	COMMAND(data_retry,               "u"        ) \
+	COMMAND(data_cancel,              "u"        ) \
 	COMMAND(op_reset,                 ""         ) \
 	COMMAND(op_blink_test,            "u"        ) \
 	COMMAND(op_select_unit0,          ""         ) \
@@ -30,7 +33,8 @@
 	COMMAND(op_select_head,           "u"        ) \
 	COMMAND(op_read_enable,           "ii"       ) \
 	COMMAND(op_read_data,             "uuu"      ) \
-	COMMAND(op_read_batch,            "uuuuii"   )
+	COMMAND(op_read_batch,            "uuuuii"   ) \
+	COMMAND(op_read_loop,             ""         )
 
 // controller protocol payload prefixes: response from controller should begin
 // with one of these

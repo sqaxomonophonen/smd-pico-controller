@@ -233,7 +233,7 @@ static void select_head(unsigned head)
 	tag2_head(head);
 }
 
-static inline void read_data(unsigned buffer_index, unsigned n_32bit_words, unsigned index_sync, unsigned skip_checks)
+static inline void read_data(unsigned buffer_index, unsigned n_bytes, unsigned index_sync, unsigned skip_checks)
 {
 	if (!skip_checks) check_drive_error();
 	if (index_sync) {
@@ -242,7 +242,7 @@ static inline void read_data(unsigned buffer_index, unsigned n_32bit_words, unsi
 		pin_wait_for_zero(GPIO_INDEX, 1000000, !skip_checks);
 		pin_wait_for_one(GPIO_INDEX,  1000000, !skip_checks);
 	}
-	clocked_read_into_buffer(buffer_index, n_32bit_words);
+	clocked_read_into_buffer(buffer_index, n_bytes);
 	while (1) {
 		if (!clocked_read_is_running()) break;
 		if (!skip_checks) check_drive_error();
@@ -252,15 +252,16 @@ static inline void read_data(unsigned buffer_index, unsigned n_32bit_words, unsi
 }
 
 #if 0
-static void read_data_normal(unsigned buffer_index, unsigned n_32bit_words)
+static void read_data_normal(unsigned buffer_index, unsigned n_bytes)
 {
-	read_data(buffer_index, n_32bit_words, /*index_sync=*/1, /*skip_checks=*/0);
+	read_data(buffer_index, n_bytes, /*index_sync=*/1, /*skip_checks=*/0);
 }
 #endif
 
 static inline void reset(void)
 {
 	multicore_reset_core1(); // waits until core1 is down
+	status = XST_IDLE;
 }
 
 static inline void reset_and_kill_output(void)
@@ -287,9 +288,11 @@ absolute_time_t xop_duration_us(void)
 	return job_duration_us;
 }
 
-void terminate_op(void)
+int terminate_op(void)
 {
+	int was_running = (status == XST_RUNNING);
 	reset_and_kill_output();
+	return was_running;
 }
 
 union {
@@ -314,12 +317,12 @@ union {
 	} read_enable;
 	struct {
 		unsigned buffer_index;
-		unsigned n_32bit_words;
+		unsigned n_bytes;
 		unsigned index_sync;
 		unsigned skip_checks;
 	} read_data;
 	struct {
-		unsigned n_32bit_words_per_track;
+		unsigned n_bytes_per_track;
 		unsigned cylinder0;
 		unsigned cylinder1;
 		unsigned head_set;
@@ -476,17 +479,17 @@ void job_read_data(void)
 		next_read_data_serial++);
 	read_data(
 		buffer_index,
-		job_args.read_data.n_32bit_words,
+		job_args.read_data.n_bytes,
 		job_args.read_data.index_sync,
 		job_args.read_data.skip_checks);
 	DONE();
 }
-unsigned xop_read_data(unsigned n_32bit_words, unsigned index_sync, unsigned skip_checks)
+unsigned xop_read_data(unsigned n_bytes, unsigned index_sync, unsigned skip_checks)
 {
 	reset();
-	const unsigned buffer_index = allocate_buffer(n_32bit_words << 2);
+	const unsigned buffer_index = allocate_buffer(n_bytes);
 	job_args.read_data.buffer_index = buffer_index;
-	job_args.read_data.n_32bit_words = n_32bit_words;
+	job_args.read_data.n_bytes = n_bytes;
 	job_args.read_data.index_sync = index_sync;
 	job_args.read_data.skip_checks = skip_checks;
 	run(job_read_data);
@@ -503,7 +506,7 @@ void job_batch_read(void)
 	const unsigned cylinder0 = job_args.batch_read.cylinder0;
 	const unsigned cylinder1 = job_args.batch_read.cylinder1;
 	const unsigned head_set = job_args.batch_read.head_set;
-	const unsigned n_32bit_words_per_track = job_args.batch_read.n_32bit_words_per_track;
+	const unsigned n_bytes_per_track = job_args.batch_read.n_bytes_per_track;
 	const int arg_servo_offset = job_args.batch_read.servo_offset;
 	const int arg_data_strobe_delay = job_args.batch_read.data_strobe_delay;
 
@@ -534,6 +537,11 @@ void job_batch_read(void)
 			if ((head_set & mask) == 0) continue;
 			select_head(head);
 			// XXX not sure if a delay is required here?
+
+			// FIXME: TRY: it might be possible to first set tag3,
+			// then servo offset, then wait for on cylinder, and
+			// then read gate
+
 			for (int data_strobe_delay = data_strobe_delay0; data_strobe_delay <= data_strobe_delay1; data_strobe_delay++) {
 				sleep_us(5);
 				const absolute_time_t t0 = get_absolute_time();
@@ -543,7 +551,7 @@ void job_batch_read(void)
 					}
 					sleep_us(5);
 				}
-				const unsigned buffer_index = allocate_buffer(n_32bit_words_per_track);
+				const unsigned buffer_index = allocate_buffer(n_bytes_per_track);
 				snprintf(
 					get_buffer_filename(buffer_index),
 					CLOCKED_READ_BUFFER_FILENAME_MAX_LENGTH,
@@ -559,7 +567,7 @@ void job_batch_read(void)
 				read_data(
 					// XXX combine these 2? I don't like the redundancy
 					buffer_index,
-					n_32bit_words_per_track,
+					n_bytes_per_track,
 					/*index_sync=*/1,
 					/*skip_checks=*/0);
 				clear_output();
@@ -568,14 +576,50 @@ void job_batch_read(void)
 	}
 	DONE();
 }
-void xop_read_batch(unsigned cylinder0, unsigned cylinder1, unsigned head_set, unsigned n_32bit_words_per_track, int servo_offset, int data_strobe_delay)
+void xop_read_batch(unsigned cylinder0, unsigned cylinder1, unsigned head_set, unsigned n_bytes_per_track, int servo_offset, int data_strobe_delay)
 {
 	reset_and_kill_output();
-	job_args.batch_read.n_32bit_words_per_track = n_32bit_words_per_track;
+	job_args.batch_read.n_bytes_per_track = n_bytes_per_track;
 	job_args.batch_read.cylinder0 = cylinder0;
 	job_args.batch_read.cylinder1 = cylinder1;
 	job_args.batch_read.head_set = head_set;
 	job_args.batch_read.servo_offset = servo_offset;
 	job_args.batch_read.data_strobe_delay = data_strobe_delay;
 	run(job_batch_read);
+}
+
+
+/////////////////////////////////////////////////////////////////////////////
+// read loop ////////////////////////////////////////////////////////////////
+unsigned loop_counter;
+void job_read_loop(void)
+{
+	BEGIN();
+	const unsigned n_bytes = MAX_DATA_BUFFER_SIZE;
+	for (;;) {
+		const absolute_time_t t0 = get_absolute_time();
+		while (!can_allocate_buffer()) {
+			if ((get_absolute_time() - t0) > 10000000) {
+				ERROR(XST_ERR_TIMEOUT);
+			}
+			sleep_us(5);
+		}
+		const unsigned buffer_index = allocate_buffer(n_bytes);
+		loop_counter++;
+		snprintf(
+			get_buffer_filename(buffer_index),
+			CLOCKED_READ_BUFFER_FILENAME_MAX_LENGTH,
+			"loop-%.5d.nrz", loop_counter);
+		read_data(
+			buffer_index,
+			n_bytes,
+			/*index_sync=*/1,
+			/*skip_checks=*/1);
+	}
+	PANIC(PANIC_UNREACHABLE);
+}
+void xop_read_loop(void)
+{
+	reset();
+	run(job_read_loop);
 }

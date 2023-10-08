@@ -1,4 +1,4 @@
-// cc -I.. cr80_extract.c -o cr80_extract
+// cc -O3 -I.. cr80_extract.c -o cr80_extract
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -10,6 +10,8 @@
 
 #define BITS_PER_SECTOR (5028) // CR8044M says 628.5 bytes per sector, 628.5*8=5028
 #define DATA_FIELD_BITS (551*8)
+
+int expected_cylinder;
 
 enum {
 	SECTOR_OK = 0,
@@ -59,6 +61,9 @@ static int try_sector(struct bits bits)
 	addr = bits_slice(addr, 16, -1);
 
 	//printf("ADDRESS cyl=%d head=%d sector=%d aux=%d\n", cylinder_cf_w, head, sector, auxiliary);
+	if (cylinder_cf_w != expected_cylinder) {
+		printf("expected cyl=%d, got ADDRESS cyl=%d head=%d sector=%d aux=%d\n", expected_cylinder, cylinder_cf_w, head, sector, auxiliary);
+	}
 
 	bits = bits_slice(bits, n_addr_bits, -1);
 
@@ -167,7 +172,7 @@ static void process_track(struct bits bits)
 			}
 		}
 
-		printf("SECTOR %.2d: %s\n", sector, ok == 2 ? "OK(VOTE)" : ok == 1 ? "OK" : "FAIL");
+		//printf("SECTOR %.2d: %s\n", sector, ok == 2 ? "OK(VOTE)" : ok == 1 ? "OK" : "FAIL");
 	}
 }
 
@@ -177,6 +182,8 @@ int main(int argc, char** argv)
 		fprintf(stderr, "Usage: %s <dump.nrz> \n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
+
+	expected_cylinder = atoi(argv[2]);
 
 	process_track(bits_load_lsb_first(argv[1]));
 

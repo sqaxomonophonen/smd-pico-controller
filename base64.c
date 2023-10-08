@@ -12,6 +12,8 @@ static inline char encode_base64_digit(unsigned v)
 	return (BASE64_DIGITS)[v];
 }
 
+// n_bytes MUST be a multiple of 3 for partial encodes (padding characters are
+// inserted otherwise)
 char* base64_encode(char* output, uint8_t* input, int n_bytes)
 {
 	uint8_t* rp = input;

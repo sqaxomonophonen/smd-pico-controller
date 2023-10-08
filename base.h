@@ -25,5 +25,7 @@ void blink(int on_ms, int off_ms);
 __attribute__ ((noreturn))
 void PANIC(uint32_t error);
 
+#define BYTES_TO_32BIT_WORDS(b) (((b)+3)>>2)
+
 #define BASE_H
 #endif

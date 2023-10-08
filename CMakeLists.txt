@@ -15,6 +15,7 @@ add_executable(${PROJECT_NAME}
 	command_parser.c
 	base64.c
 	adler32.c
+	dumbrle.c
 	base.c
 	loopback_test.c
 )

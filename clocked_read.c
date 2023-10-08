@@ -5,10 +5,17 @@
 #include "base.h"
 #include "pin_config.h"
 
-static uint8_t buffer[CLOCKED_READ_BUFFER_COUNT][MAX_DATA_BUFFER_SIZE];
-static unsigned buffer_size[CLOCKED_READ_BUFFER_COUNT];
-static enum buffer_status buffer_status[CLOCKED_READ_BUFFER_COUNT];
-static char buffer_filename[CLOCKED_READ_BUFFER_COUNT][CLOCKED_READ_BUFFER_FILENAME_MAX_LENGTH];
+struct buffer {
+	uint8_t data[MAX_DATA_BUFFER_SIZE];
+	unsigned size;
+	enum buffer_status status;
+	char filename[CLOCKED_READ_BUFFER_FILENAME_MAX_LENGTH];
+};
+
+struct buffer buffers[CLOCKED_READ_BUFFER_COUNT];
+
+_Static_assert(sizeof(buffers[0]) % 4 == 0);
+
 static PIO pio;
 static uint sm;
 static uint dma_channel;
@@ -47,10 +54,13 @@ static void check_buffer_index(unsigned buffer_index)
 	if (buffer_index >= CLOCKED_READ_BUFFER_COUNT) PANIC(PANIC_BOUNDS_CHECK_FAILED);
 }
 
-void clocked_read_into_buffer(unsigned buffer_index, unsigned word_32bit_count)
+void clocked_read_into_buffer(unsigned buffer_index, unsigned n_bytes)
 {
+	if (n_bytes > MAX_DATA_BUFFER_SIZE) n_bytes = MAX_DATA_BUFFER_SIZE;
+
 	check_buffer_index(buffer_index);
-	if (buffer_status[buffer_index] != BUSY) PANIC(PANIC_UNEXPECTED_STATE);
+	struct buffer* buf = &buffers[buffer_index];
+	if (buf->status != BUSY) PANIC(PANIC_UNEXPECTED_STATE);
 
 	pio_sm_set_enabled(pio, sm, false);
 
@@ -62,16 +72,12 @@ void clocked_read_into_buffer(unsigned buffer_index, unsigned word_32bit_count)
 	channel_config_set_write_increment(&dma_channel_cfg, true);
 	channel_config_set_dreq(&dma_channel_cfg, pio_get_dreq(pio, sm, false));
 
-	const unsigned max_word_32bit_count =  MAX_DATA_BUFFER_SIZE >> 2;
-	if (word_32bit_count > max_word_32bit_count) {
-		word_32bit_count = max_word_32bit_count;
-	}
 	dma_channel_configure(
 		dma_channel,
 		&dma_channel_cfg,
-		buffer[buffer_index], // write to buffer
-		&pio->rxf[sm],             // read from PIO RX FIFO
-		word_32bit_count,
+		buf->data,     // write to buffer
+		&pio->rxf[sm], // read from PIO RX FIFO
+		BYTES_TO_32BIT_WORDS(n_bytes),
 		true // start now!
 	);
 
@@ -86,7 +92,7 @@ int clocked_read_is_running(void)
 static int find_buffer_index(enum buffer_status with_buffer_status)
 {
 	for (unsigned i = 0; i < CLOCKED_READ_BUFFER_COUNT; i++) {
-		if (buffer_status[i] == with_buffer_status) {
+		if (buffers[i].status == with_buffer_status) {
 			return i;
 		}
 	}
@@ -113,53 +119,61 @@ unsigned allocate_buffer(unsigned size)
 	const int i = get_next_free_buffer_index();
 	if (i < 0) PANIC(PANIC_ALLOCATION_ERROR);
 	check_buffer_index(i);
-	buffer_status[i] = BUSY;
+	struct buffer* buf = &buffers[i];
+	buf->status = BUSY;
 	if (size > MAX_DATA_BUFFER_SIZE) size = MAX_DATA_BUFFER_SIZE;
-	buffer_size[i] = size;
+	buf->size = size;
 	return i;
 }
 
 uint8_t* get_buffer_data(unsigned buffer_index)
 {
 	check_buffer_index(buffer_index);
-	return buffer[buffer_index];
+	return buffers[buffer_index].data;
 }
 
 char* get_buffer_filename(unsigned buffer_index)
 {
 	check_buffer_index(buffer_index);
-	return buffer_filename[buffer_index];
+	return buffers[buffer_index].filename;
 }
 
 enum buffer_status get_buffer_status(unsigned buffer_index)
 {
 	check_buffer_index(buffer_index);
-	return buffer_status[buffer_index];
-}
-
-void release_buffer(unsigned buffer_index)
-{
-	check_buffer_index(buffer_index);
-	if (buffer_status[buffer_index] != WRITTEN) PANIC(PANIC_UNEXPECTED_STATE);
-	buffer_status[buffer_index] = FREE;
+	return buffers[buffer_index].status;
 }
 
 void wrote_buffer(unsigned buffer_index)
 {
 	check_buffer_index(buffer_index);
-	if (buffer_status[buffer_index] != BUSY) PANIC(PANIC_UNEXPECTED_STATE);
-	buffer_status[buffer_index] = WRITTEN;
+	if (get_buffer_status(buffer_index) != BUSY) PANIC(PANIC_UNEXPECTED_STATE);
+	buffers[buffer_index].status = WRITTEN;
+}
+
+void transferred_buffer(unsigned buffer_index)
+{
+	check_buffer_index(buffer_index);
+	if (get_buffer_status(buffer_index) != WRITTEN) PANIC(PANIC_UNEXPECTED_STATE);
+	buffers[buffer_index].status = TRANSFERRED;
+}
+
+void release_buffer(unsigned buffer_index)
+{
+	check_buffer_index(buffer_index);
+	if (get_buffer_status(buffer_index) != TRANSFERRED) PANIC(PANIC_UNEXPECTED_STATE);
+	buffers[buffer_index].status = FREE;
 }
 
 unsigned get_buffer_size(unsigned buffer_index)
 {
 	check_buffer_index(buffer_index);
-	return buffer_size[buffer_index];
+	return buffers[buffer_index].size;
 }
 
 void reset_buffers(void)
 {
 	for (int i = 0; i < CLOCKED_READ_BUFFER_COUNT; i++) {
-		buffer_status[i] = FREE;
+		buffers[i].status = FREE;
 	}
 }
