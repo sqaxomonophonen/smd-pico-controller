@@ -1,9 +1,0 @@
-.program loopback_test
-; loopback test signal
-
-.side_set 1
-
-loop:
-	out pins, 1    side 0 ; CLK->0, output new data
-	jmp loop       side 1 ; CLK->1
-
